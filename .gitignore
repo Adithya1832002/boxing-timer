@@ -145,5 +145,33 @@ vite.config.ts.timestamp-*
 # Astro generated types
 .astro/
 
-# Turbo Repo
+# Turbo Repos
 .turbo
+
+# Expo
+.expo/
+web-build/
+expo-env.d.ts
+
+# Native development
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# macOS
+.DS_Store
+*.pem
+
+# Local environment files
+.env*.local
+
+# Generated native folders
+/ios
+/android
