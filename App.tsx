@@ -1,5 +1,5 @@
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   SafeAreaView,
   View,
@@ -11,6 +11,7 @@ import {
   Pressable,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 
 // --------------------------------------------------
 // TYPES
@@ -23,6 +24,7 @@ type Workout = {
   setTimeSeconds: number;
   restTimeSeconds: number;
   warmupTimeSeconds: number;
+  subroundDurationSeconds: number;
   isStandard: boolean;
 };
 
@@ -35,6 +37,8 @@ type WorkoutForm = {
   restSeconds: string;
   warmupMinutes: string;
   warmupSeconds: string;
+  subroundMinutes: string;
+  subroundSeconds: string;
 };
 
 type Phase = 'warmup' | 'round' | 'rest';
@@ -59,6 +63,7 @@ const STANDARD_WORKOUT: Workout = {
   setTimeSeconds: 180,
   restTimeSeconds: 60,
   warmupTimeSeconds: 30,
+  subroundDurationSeconds: 60,
   isStandard: true,
 };
 
@@ -71,6 +76,8 @@ const EMPTY_FORM: WorkoutForm = {
   restSeconds: '00',
   warmupMinutes: '0',
   warmupSeconds: '30',
+  subroundMinutes: '1',
+  subroundSeconds: '00',
 };
 
 // --------------------------------------------------
@@ -100,6 +107,7 @@ function workoutToForm(workout: Workout): WorkoutForm {
   const setTime = secondsToFormValue(workout.setTimeSeconds);
   const restTime = secondsToFormValue(workout.restTimeSeconds);
   const warmupTime = secondsToFormValue(workout.warmupTimeSeconds);
+  const subroundTime = secondsToFormValue(workout.subroundDurationSeconds);
 
   return {
     name: workout.name,
@@ -110,6 +118,8 @@ function workoutToForm(workout: Workout): WorkoutForm {
     restSeconds: restTime.seconds,
     warmupMinutes: warmupTime.minutes,
     warmupSeconds: warmupTime.seconds,
+    subroundMinutes: subroundTime.minutes,
+    subroundSeconds: subroundTime.seconds,
   };
 }
 
@@ -186,6 +196,10 @@ function migrateWorkout(item: Record<string, unknown>): Workout | null {
       setTimeSeconds: item.setTimeSeconds,
       restTimeSeconds: item.restTimeSeconds,
       warmupTimeSeconds: item.warmupTimeSeconds,
+      subroundDurationSeconds:
+        typeof item.subroundDurationSeconds === 'number'
+          ? item.subroundDurationSeconds
+          : 60,
       isStandard: false,
     };
   }
@@ -211,6 +225,7 @@ function migrateWorkout(item: Record<string, unknown>): Workout | null {
         String(item.warmupMinutes ?? '0'),
         String(item.warmupSeconds ?? '0'),
       ),
+      subroundDurationSeconds: 60,
       isStandard: false,
     };
   }
@@ -218,11 +233,110 @@ function migrateWorkout(item: Record<string, unknown>): Workout | null {
   return null;
 }
 
+type AudioCue = {
+  id: string;
+  atMs: number;
+  sound: 'bell' | 'warning' | 'rest' | 'subround';
+};
+
+function getAudioCues(
+  plan: Segment[],
+  workout: Workout,
+): AudioCue[] {
+  const cues: AudioCue[] = [];
+  const bellTimes = new Set<number>();
+
+  const addBell = (atSeconds: number, id: string) => {
+    // If a round ends exactly when another starts (zero rest), play one bell.
+    if (bellTimes.has(atSeconds)) return;
+    bellTimes.add(atSeconds);
+    cues.push({ id, atMs: atSeconds * 1000, sound: 'bell' });
+  };
+
+  // A warm-up begins with a bell. If there is no warm-up, the first round
+  // start below supplies the opening bell instead.
+  const warmup = plan.find(segment => segment.phase === 'warmup');
+  if (warmup) addBell(warmup.start, 'warmup-start');
+
+  plan.forEach((segment, index) => {
+    if (segment.phase === 'round') {
+      // Bell at the start and end of every work round.
+      addBell(segment.start, `round-${segment.round}-start`);
+      addBell(segment.end, `round-${segment.round}-end`);
+      // The warning bell sounds once, exactly 10 seconds before this round ends.
+      const warningAt = segment.end - 10;
+      if (warningAt >= segment.start && warningAt < segment.end) {
+        cues.push({
+          id: `warning-${index}`,
+          atMs: warningAt * 1000,
+          sound: 'warning',
+        });
+      }
+
+      // Subround double-beeps occur at elapsed multiples of the configured duration.
+      const subround = workout.subroundDurationSeconds;
+      if (subround > 0) {
+        for (let elapsedInRound = subround; elapsedInRound < segment.duration; elapsedInRound += subround) {
+          cues.push({
+            id: `subround-${index}-${elapsedInRound}`,
+            atMs: (segment.start + elapsedInRound) * 1000,
+            sound: 'subround',
+          });
+        }
+      }
+    }
+
+    if (segment.phase === 'rest') {
+      // Beep once for each of the final five seconds (or all seconds for rests shorter than five seconds).
+      for (let secondsRemaining = Math.min(5, segment.duration); secondsRemaining >= 1; secondsRemaining--) {
+        const cueAt = segment.end - secondsRemaining;
+        cues.push({
+          id: `rest-${index}-${secondsRemaining}`,
+          atMs: cueAt * 1000,
+          sound: 'rest',
+        });
+      }
+    }
+  });
+
+  return cues.sort((a, b) => a.atMs - b.atMs);
+}
+
 // --------------------------------------------------
 // MAIN APP
 // --------------------------------------------------
 
 export default function App() {
+  // Short local sound effects. Players are created once and reused for each cue.
+  const boxingBellPlayer = useAudioPlayer(require('./assets/sounds/boxing-bell.wav'));
+  const warningPlayer = useAudioPlayer(require('./assets/sounds/boxing-bell-single.wav'));
+  const restBeepPlayer = useAudioPlayer(require('./assets/sounds/rest-beep.wav'));
+  const subroundPlayer = useAudioPlayer(require('./assets/sounds/subround-double-beep.wav'));
+  const previousCueElapsedMs = useRef(0);
+  const firedCueIds = useRef<Set<string>>(new Set());
+
+  const playCue = (sound: AudioCue['sound']) => {
+    const player =
+      sound === 'bell'
+        ? boxingBellPlayer
+        : sound === 'warning'
+          ? warningPlayer
+          : sound === 'rest'
+            ? restBeepPlayer
+            : subroundPlayer;
+
+    void player.seekTo(0).then(() => player.play()).catch(error => {
+      console.warn('Could not play workout sound:', error);
+    });
+  };
+
+  useEffect(() => {
+    void setAudioModeAsync({
+      playsInSilentMode: true,
+      interruptionMode: 'mixWithOthers',
+    });
+  }, []);
+
   // Navigation
   const [screen, setScreen] = useState<Screen>('home');
 
@@ -369,15 +483,22 @@ export default function App() {
       form.warmupSeconds,
     );
 
+    const subroundDuration = toTotalSeconds(
+      form.subroundMinutes,
+      form.subroundSeconds,
+    );
+
     const validSeconds =
       Number(form.setSeconds) <= 59 &&
       Number(form.restSeconds) <= 59 &&
-      Number(form.warmupSeconds) <= 59;
+      Number(form.warmupSeconds) <= 59 &&
+      Number(form.subroundSeconds) <= 59;
 
     const validMinutes =
       Number(form.setMinutes) <= 999 &&
       Number(form.restMinutes) <= 999 &&
-      Number(form.warmupMinutes) <= 999;
+      Number(form.warmupMinutes) <= 999 &&
+      Number(form.subroundMinutes) <= 999;
 
     if (!name) {
       Alert.alert('Workout name required', 'Please enter a workout name.');
@@ -420,6 +541,7 @@ export default function App() {
       setTimeSeconds: setTime,
       restTimeSeconds: restTime,
       warmupTimeSeconds: warmupTime,
+      subroundDurationSeconds: subroundDuration,
       isStandard: false,
     };
 
@@ -480,6 +602,8 @@ export default function App() {
     setSelectedWorkout(workout);
     setPlan(workoutPlan);
     setElapsedMs(0);
+    previousCueElapsedMs.current = 0;
+    firedCueIds.current.clear();
     setStartedAt(null);
     setStatus('ready');
     setScreen('timer');
@@ -497,6 +621,8 @@ export default function App() {
     setSelectedWorkout(null);
     setPlan([]);
     setElapsedMs(0);
+    previousCueElapsedMs.current = 0;
+    firedCueIds.current.clear();
     setStartedAt(null);
     setStatus('ready');
     setScreen('home');
@@ -507,17 +633,35 @@ export default function App() {
   // ------------------------------------------------
 
   useEffect(() => {
-    if (status !== 'running' || startedAt === null) {
+    if (status !== 'running' || startedAt === null || !selectedWorkout) {
       return;
     }
 
+    const audioCues = getAudioCues(plan, selectedWorkout);
+
     const interval = setInterval(() => {
       const elapsed = Date.now() - startedAt;
-
       const totalDuration =
         plan.length > 0
           ? plan[plan.length - 1].end * 1000
           : 0;
+      const boundedElapsed = Math.min(elapsed, totalDuration);
+      const previousElapsed = previousCueElapsedMs.current;
+
+      // Check cue timestamps rather than relying on an exact 200ms timer tick.
+      // The fired-ID set prevents duplicate playback across repeated React renders.
+      audioCues.forEach(cue => {
+        if (
+          cue.atMs >= previousElapsed &&
+          cue.atMs <= boundedElapsed &&
+          !firedCueIds.current.has(cue.id)
+        ) {
+          firedCueIds.current.add(cue.id);
+          playCue(cue.sound);
+        }
+      });
+
+      previousCueElapsedMs.current = boundedElapsed;
 
       if (elapsed >= totalDuration) {
         setElapsedMs(totalDuration);
@@ -528,12 +672,14 @@ export default function App() {
     }, 200);
 
     return () => clearInterval(interval);
-  }, [status, startedAt, plan]);
+  }, [status, startedAt, plan, selectedWorkout]);
 
   const startWorkout = () => {
     if (!selectedWorkout || plan.length === 0) return;
 
     setElapsedMs(0);
+    previousCueElapsedMs.current = 0;
+    firedCueIds.current.clear();
     setStartedAt(Date.now());
     setStatus('running');
   };
@@ -551,10 +697,12 @@ export default function App() {
     }
 
     setElapsedMs(elapsed);
+    previousCueElapsedMs.current = elapsed;
     setStatus('paused');
   };
 
   const resumeWorkout = () => {
+    previousCueElapsedMs.current = elapsedMs;
     setStartedAt(Date.now() - elapsedMs);
     setStatus('running');
   };
@@ -563,6 +711,8 @@ export default function App() {
     if (!selectedWorkout) return;
 
     setElapsedMs(0);
+    previousCueElapsedMs.current = 0;
+    firedCueIds.current.clear();
     setStartedAt(null);
     setStatus('ready');
   };
@@ -821,11 +971,24 @@ export default function App() {
                 updateForm('warmupSeconds', value)
               }
             />
+
+            <SettingRow
+              label="Subround duration"
+              minutes={form.subroundMinutes}
+              seconds={form.subroundSeconds}
+              onMinutesChange={value =>
+                updateForm('subroundMinutes', value)
+              }
+              onSecondsChange={value =>
+                updateForm('subroundSeconds', value)
+              }
+            />
           </View>
 
           <Text style={styles.note}>
             Warm-up happens once before the first round.
             Rest happens only between rounds.
+            Subround duration controls the double-beep interval during work rounds; set it to 00:00 to disable.
           </Text>
 
           <View style={styles.formSummary}>
@@ -957,6 +1120,15 @@ export default function App() {
             <DetailRow
               label="Warm-up"
               value={formatTime(selectedWorkout.warmupTimeSeconds)}
+            />
+
+            <DetailRow
+              label="Subround duration"
+              value={
+                selectedWorkout.subroundDurationSeconds > 0
+                  ? formatTime(selectedWorkout.subroundDurationSeconds)
+                  : 'Off'
+              }
             />
 
             <DetailRow
